@@ -120,6 +120,18 @@ type MyClient struct {
 	natsProducer       producer_interfaces.Producer
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
+	// appStateRecoveryState throttles reactive recovery attempts per patch name.
+	// Key: string (appstate.WAPatchName), Value: *appStateRecoveryEntry.
+	appStateRecoveryState sync.Map
+}
+
+// appStateRecoveryEntry tracks when full sync and recovery snapshot were last
+// attempted for a given app state patch on this instance. Guarded by mu so that
+// bursts of AppStateSyncError events don't race the escalation ladder.
+type appStateRecoveryEntry struct {
+	mu             sync.Mutex
+	lastFullSyncAt time.Time
+	lastRecoveryAt time.Time
 }
 
 type ClientData struct {
@@ -844,6 +856,75 @@ func processPresenceUpdates(mycli *MyClient) {
 	}
 }
 
+// handleAppStateSyncError reacts to whatsmeow dispatching AppStateSyncError,
+// which fires when DecodePatches returns ErrMismatchingLTHash / ErrMismatchingPatchMAC
+// (or ErrKeyNotFound path failures). The library itself does nothing beyond the
+// dispatch — recovery is left as an implementation detail for the library user,
+// per upstream guidance (tulir/whatsmeow PR #1120).
+//
+// Escalation ladder, throttled per (userID, patchName):
+//
+//	L1  full sync  — cooldown 1h
+//	L2  recovery snapshot request to primary device — cooldown 30m
+//	L3  noop + log — within cooldown window
+//
+// Why the ladder: full sync is cheap-ish and resolves most divergences with the
+// server's own patches. Recovery snapshot involves asking the primary device
+// (phone) for a fresh collection, which is heavier and can annoy users if
+// spammed. Fatal notification (destructive, logs out all devices, resets to v1)
+// is intentionally out of scope for the PoC.
+func (mycli *MyClient) handleAppStateSyncError(evt *events.AppStateSyncError) {
+	log := mycli.loggerWrapper.GetLogger(mycli.userID)
+	name := evt.Name
+	nameStr := string(name)
+
+	const fullSyncCooldown = 1 * time.Hour
+	const recoveryCooldown = 30 * time.Minute
+
+	entryRaw, _ := mycli.appStateRecoveryState.LoadOrStore(nameStr, &appStateRecoveryEntry{})
+	entry := entryRaw.(*appStateRecoveryEntry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	now := time.Now()
+
+	if now.Sub(entry.lastFullSyncAt) > fullSyncCooldown {
+		log.LogWarn("[%s] AppStateSyncError on %s (fullSync=%v, err=%v): triggering full sync",
+			mycli.userID, nameStr, evt.FullSync, evt.Error)
+		entry.lastFullSyncAt = now
+		go func() {
+			ctx := context.Background()
+			if err := mycli.WAClient.FetchAppState(ctx, name, true, false); err != nil {
+				log.LogError("[%s] full sync for %s failed: %v", mycli.userID, nameStr, err)
+			} else {
+				log.LogInfo("[%s] full sync for %s dispatched", mycli.userID, nameStr)
+			}
+		}()
+		return
+	}
+
+	if now.Sub(entry.lastRecoveryAt) > recoveryCooldown {
+		log.LogWarn("[%s] AppStateSyncError on %s (err=%v): full sync recent, requesting recovery snapshot",
+			mycli.userID, nameStr, evt.Error)
+		entry.lastRecoveryAt = now
+		go func() {
+			ctx := context.Background()
+			msg := whatsmeow.BuildAppStateRecoveryRequest(name)
+			if _, err := mycli.WAClient.SendPeerMessage(ctx, msg); err != nil {
+				log.LogError("[%s] recovery request for %s failed: %v", mycli.userID, nameStr, err)
+			} else {
+				log.LogInfo("[%s] recovery snapshot request for %s dispatched", mycli.userID, nameStr)
+			}
+		}()
+		return
+	}
+
+	log.LogWarn("[%s] AppStateSyncError on %s: within cooldown (lastFullSync=%s, lastRecovery=%s), skipping",
+		mycli.userID, nameStr,
+		entry.lastFullSyncAt.Format(time.RFC3339),
+		entry.lastRecoveryAt.Format(time.RFC3339))
+}
+
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	userID := mycli.userID
 	postMap := make(map[string]interface{})
@@ -860,6 +941,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Marked self as unavailable", mycli.userID)
 			}
 		}
+	case *events.AppStateSyncError:
+		mycli.handleAppStateSyncError(evt)
 	case *events.Connected, *events.PushNameSetting:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] events.Connected to Whatsapp for user '%s'", mycli.userID, mycli.WAClient.Store.PushName)
 		if len(mycli.WAClient.Store.PushName) > 0 {
