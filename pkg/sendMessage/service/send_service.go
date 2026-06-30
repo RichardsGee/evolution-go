@@ -1378,6 +1378,15 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 					JPEGThumbnail: jpegThumb,
 				}}
 			}
+			// Preenche Width/Height/JPEGThumbnail (caminho URL) pra o feed renderizar
+			// na proporção correta — sem isso o WhatsApp mostra preview quadrado. (guiaox#113)
+			if w, h, thumb := imageDimsAndThumbnail(fileData); w > 0 && h > 0 {
+				media.ImageMessage.Width = proto.Uint32(w)
+				media.ImageMessage.Height = proto.Uint32(h)
+				if len(thumb) > 0 {
+					media.ImageMessage.JPEGThumbnail = thumb
+				}
+			}
 			mediaType = "ImageMessage"
 		case "video":
 			if isNewsletter {
