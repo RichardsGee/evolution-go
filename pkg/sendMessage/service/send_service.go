@@ -948,6 +948,16 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 					FileLength:    proto.Uint64(uint64(len(fileData))),
 				}}
 			}
+			// Preenche Width/Height/JPEGThumbnail pra o feed (ex.: Canal/newsletter)
+			// renderizar na proporção correta — sem isso o WhatsApp mostra preview
+			// quadrado no feed e a proporção real só aparece ao abrir. (guiaox#113)
+			if w, h, thumb := imageDimsAndThumbnail(fileData); w > 0 && h > 0 {
+				media.ImageMessage.Width = proto.Uint32(w)
+				media.ImageMessage.Height = proto.Uint32(h)
+				if len(thumb) > 0 {
+					media.ImageMessage.JPEGThumbnail = thumb
+				}
+			}
 			mediaType = "ImageMessage"
 		case "video":
 			if isNewsletter {
@@ -2853,4 +2863,44 @@ func NewSendService(
 		config:           config,
 		loggerWrapper:    loggerWrapper,
 	}
+}
+
+// imageDimsAndThumbnail decodifica os bytes de uma imagem e retorna largura,
+// altura e um thumbnail JPEG (~72px de largura). Usado pra preencher
+// Width/Height/JPEGThumbnail na ImageMessage — sem isso o WhatsApp renderiza
+// preview QUADRADO no feed (ex.: Canal/newsletter) e a proporção real só
+// aparece ao abrir. Retorna 0/0/nil se não decodificar (fallback seguro pro
+// comportamento antigo). (guiaox#113)
+func imageDimsAndThumbnail(fileData []byte) (width, height uint32, jpegThumb []byte) {
+	img, _, err := image.Decode(bytes.NewReader(fileData))
+	if err != nil {
+		return 0, 0, nil
+	}
+	bounds := img.Bounds()
+	if bounds.Dx() <= 0 || bounds.Dy() <= 0 {
+		return 0, 0, nil
+	}
+	width = uint32(bounds.Dx())
+	height = uint32(bounds.Dy())
+
+	// Thumbnail ~72px de largura, mantendo proporção (mesma lógica nearest-neighbor
+	// já usada em outros pontos do arquivo).
+	thumbWidth := 72
+	thumbHeight := int(float64(bounds.Dy()) * float64(thumbWidth) / float64(bounds.Dx()))
+	if thumbHeight < 1 {
+		thumbHeight = 1
+	}
+	thumbImg := image.NewRGBA(image.Rect(0, 0, thumbWidth, thumbHeight))
+	for y := 0; y < thumbHeight; y++ {
+		for x := 0; x < thumbWidth; x++ {
+			srcX := x*bounds.Dx()/thumbWidth + bounds.Min.X
+			srcY := y*bounds.Dy()/thumbHeight + bounds.Min.Y
+			thumbImg.Set(x, y, img.At(srcX, srcY))
+		}
+	}
+	var thumbBuf bytes.Buffer
+	if jpeg.Encode(&thumbBuf, thumbImg, &jpeg.Options{Quality: 50}) == nil {
+		jpegThumb = thumbBuf.Bytes()
+	}
+	return width, height, jpegThumb
 }
