@@ -356,17 +356,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	if w.config.WhatsappVersionMajor != 0 && w.config.WhatsappVersionMinor != 0 && w.config.WhatsappVersionPatch != 0 {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version to %d.%d.%d", cd.Instance.Id, w.config.WhatsappVersionMajor, w.config.WhatsappVersionMinor, w.config.WhatsappVersionPatch)
 		version.Major = w.config.WhatsappVersionMajor
-		if err == nil {
-			store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
-		}
 		version.Minor = w.config.WhatsappVersionMinor
-		if err == nil {
-			store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
-		}
 		version.Patch = w.config.WhatsappVersionPatch
-		if err == nil {
-			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
-		}
+		applyWhatsAppVersion(version)
 	} else {
 		// Try to fetch version from WhatsApp Web
 		webVersion, err := fetchWhatsAppWebVersion()
@@ -375,9 +367,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		} else {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version from web to %d.%d.%d", cd.Instance.Id, webVersion.Major, webVersion.Minor, webVersion.Patch)
 			version = *webVersion
-			store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
-			store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
-			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
+			applyWhatsAppVersion(version)
 		}
 	}
 
@@ -2477,6 +2467,29 @@ var (
 	cachedWebVersionMu sync.Mutex
 	webVersionCacheTTL = 1 * time.Hour
 )
+
+// applyWhatsAppVersion aplica a versão do WhatsApp Web em todos os lugares que
+// importam.
+//
+// store.DeviceProps.Version é apenas metadado do companion (o que aparece na
+// lista de aparelhos conectados do celular). A versão que o servidor valida no
+// handshake vive em store.waVersion, alterada por store.SetWAVersion. Sem essa
+// chamada o cliente anuncia a versão fixa embutida na lib e o WhatsApp responde
+// "Client outdated (405)", derrubando a conexão antes de emitir qualquer QR code.
+//
+// SetWAVersion atualiza o hash de build, mas não o AppVersion do ClientPayload,
+// que é montado na inicialização do pacote store — por isso ele é escrito aqui
+// também.
+func applyWhatsAppVersion(version clientVersion) {
+	waVersion := store.WAVersionContainer{uint32(version.Major), uint32(version.Minor), uint32(version.Patch)}
+
+	store.SetWAVersion(waVersion)
+	store.BaseClientPayload.UserAgent.AppVersion = waVersion.ProtoAppVersion()
+
+	store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
+	store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
+	store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
+}
 
 func fetchWhatsAppWebVersion() (*clientVersion, error) {
 	cachedWebVersionMu.Lock()
