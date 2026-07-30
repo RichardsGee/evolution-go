@@ -392,6 +392,18 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.clientPointer[cd.Instance.Id] = client
 
+	// Se a conexão falhar, o cliente não pode ficar órfão no mapa: qualquer
+	// tentativa posterior de conectar ou de pedir QR code encontraria um
+	// cliente desconectado e desistiria sem nunca reiniciar a instância.
+	defer func() {
+		if current, ok := w.clientPointer[cd.Instance.Id]; ok && current == client && !current.IsConnected() {
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Cleaning up client that failed to connect", cd.Instance.Id)
+
+			delete(w.clientPointer, cd.Instance.Id)
+			delete(w.myClientPointer, cd.Instance.Id)
+		}
+	}()
+
 	if cd.IsProxy {
 		var proxyConfig ProxyConfig
 		err := json.Unmarshal([]byte(cd.Instance.Proxy), &proxyConfig)

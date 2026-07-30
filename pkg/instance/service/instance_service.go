@@ -24,6 +24,13 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
+const (
+	// Tempo máximo de espera pelo primeiro evento "code" depois de (re)iniciar
+	// a instância, e intervalo entre as leituras do QR code no banco.
+	qrCodeWaitTimeout  = 15 * time.Second
+	qrCodePollInterval = 500 * time.Millisecond
+)
+
 type InstanceService interface {
 	Create(data *CreateStruct) (*instance_model.Instance, error)
 	Connect(data *ConnectStruct, instance *instance_model.Instance) (*instance_model.Instance, string, string, error)
@@ -405,46 +412,60 @@ func (i instances) GetQr(instance *instance_model.Instance) (*QrcodeStruct, erro
 	logger := i.loggerWrapper.GetLogger(instance.Id)
 	client := i.clientPointer[instance.Id]
 
-	// Se não há cliente ou o cliente está logado, precisamos iniciar um novo cliente
-	if client == nil || client.IsLoggedIn() {
-		if client != nil && client.IsLoggedIn() {
-			logger.LogInfo("[%s] Client is logged in, starting new instance for QR code", instance.Id)
-		} else {
-			logger.LogInfo("[%s] No client found, starting new instance for QR code", instance.Id)
-		}
-
-		// Iniciar nova instância para gerar QR code
-		err := i.whatsmeowService.StartInstance(instance.Id)
-		if err != nil {
-			logger.LogError("[%s] Failed to start instance: %v", instance.Id, err)
-			return nil, fmt.Errorf("failed to start instance: %w", err)
-		}
-
-		// Aguardar um pouco para o cliente iniciar e gerar QR code
-		logger.LogInfo("[%s] Waiting for QR code generation...", instance.Id)
-		time.Sleep(3 * time.Second)
-
-		// Verificar novamente se há cliente
-		client = i.clientPointer[instance.Id]
-		if client != nil && client.IsLoggedIn() {
-			return nil, fmt.Errorf("session already logged in")
-		}
-	} else if !client.IsConnected() {
-		// Se o cliente existe mas não está conectado, pode estar aguardando QR code
-		logger.LogInfo("[%s] Client exists but not connected, checking for existing QR code", instance.Id)
-	}
-
 	// Buscar instância atualizada do banco para pegar o QR code mais recente
 	instance, err := i.instanceRepository.GetInstanceByID(instance.Id)
 	if err != nil {
 		return nil, err
 	}
 
+	restarted := true
+
+	switch {
+	case client == nil:
+		logger.LogInfo("[%s] No client found, starting new instance for QR code", instance.Id)
+
+		if err := i.whatsmeowService.StartInstance(instance.Id); err != nil {
+			logger.LogError("[%s] Failed to start instance: %v", instance.Id, err)
+			return nil, fmt.Errorf("failed to start instance: %w", err)
+		}
+	case client.IsLoggedIn():
+		// Sessão ativa: não há QR code a emitir e derrubá-la aqui desconectaria
+		// o usuário só porque a tela de conexão foi aberta.
+		logger.LogInfo("[%s] Client is already logged in, no QR code to return", instance.Id)
+		return nil, fmt.Errorf("session already logged in")
+	case !client.IsConnected():
+		// Cliente órfão: ficou no mapa mas o socket caiu (ex.: falha de conexão
+		// durante o StartClient). Sem derrubá-lo nenhum QR code novo é emitido,
+		// então o /instance/qr responderia 400 para sempre.
+		logger.LogWarn("[%s] Client exists but is disconnected, restarting instance for QR code", instance.Id)
+
+		if err := i.whatsmeowService.ReconnectClient(instance.Id); err != nil {
+			logger.LogError("[%s] Failed to restart instance: %v", instance.Id, err)
+			return nil, fmt.Errorf("failed to start instance: %w", err)
+		}
+	default:
+		// Cliente conectado e aguardando leitura: o QR code já existente serve.
+		logger.LogInfo("[%s] Client connected and waiting for pairing, reusing current QR code", instance.Id)
+		restarted = false
+	}
+
 	code := instance.Qrcode
-	if code == "" {
-		// Se não há QR code ainda, aguardar um pouco mais e tentar novamente
-		logger.LogInfo("[%s] No QR code available yet, waiting a bit more...", instance.Id)
-		time.Sleep(2 * time.Second)
+
+	// A instância foi reiniciada: o QR code que está no banco é da sessão
+	// anterior e já expirou. Descarta para esperar o próximo evento "code".
+	if restarted && code != "" {
+		code = ""
+		if err := i.instanceRepository.UpdateQrcode(instance.Id, ""); err != nil {
+			logger.LogWarn("[%s] Failed to clear stale QR code: %v", instance.Id, err)
+		}
+	}
+
+	// Aguardar o QR code aparecer no banco, checando periodicamente em vez de
+	// dormir um tempo fixo.
+
+	deadline := time.Now().Add(qrCodeWaitTimeout)
+	for code == "" && time.Now().Before(deadline) {
+		time.Sleep(qrCodePollInterval)
 
 		instance, err = i.instanceRepository.GetInstanceByID(instance.Id)
 		if err != nil {
@@ -452,9 +473,17 @@ func (i instances) GetQr(instance *instance_model.Instance) (*QrcodeStruct, erro
 		}
 
 		code = instance.Qrcode
+
 		if code == "" {
-			return nil, fmt.Errorf("no QR code available. Please wait a moment and try again")
+			if client = i.clientPointer[instance.Id]; client != nil && client.IsLoggedIn() {
+				return nil, fmt.Errorf("session already logged in")
+			}
 		}
+	}
+
+	if code == "" {
+		logger.LogWarn("[%s] No QR code available after %s", instance.Id, qrCodeWaitTimeout)
+		return nil, fmt.Errorf("no QR code available. Please wait a moment and try again")
 	}
 
 	parts := strings.Split(code, "|")
