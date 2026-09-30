@@ -1,9 +1,10 @@
 name: Build and Publish Docker Image
 
+# No fork, este workflow do upstream publicaria em evoapicloud/evolution-go
+# (Docker Hub da Evolution, sem credencial aqui) a cada push na main e só
+# queimaria minuto. A imagem do fork sai do publish_ghcr_fork.yml.
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   build_deploy:
