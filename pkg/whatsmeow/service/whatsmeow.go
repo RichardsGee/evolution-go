@@ -867,7 +867,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		// so the socket survives a passkey ceremony). Forward + rotate them.
 		mycli.handleQRCodes(evt.Codes)
 		return
+	case *events.AppStateSyncError:
+		mycli.handleAppStateSyncError(evt)
+		return
 	case *events.AppStateSyncComplete:
+		if evt.Recovery {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] App state %s recovered from phone at v%d", mycli.userID, evt.Name, evt.Version)
+		}
 		if len(mycli.WAClient.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
 			err := mycli.WAClient.SendPresence(context.Background(), types.PresenceUnavailable)
 			if err != nil {
